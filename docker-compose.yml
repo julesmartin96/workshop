@@ -1,0 +1,110 @@
+name: sentinel-x
+
+networks:
+  sentinel:
+    name: sentinel_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  pgdata:
+  mosquitto-data:
+
+x-common: &common
+  restart: unless-stopped
+  networks: [sentinel]
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  postgres:
+    <<: *common
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    mem_limit: 512m
+    # aucun "ports:" : joignable uniquement par l'API sur postgres:5432
+
+  mosquitto:
+    <<: *common
+    image: eclipse-mosquitto:2
+    user: "1883:1883"
+    cap_drop: [ALL]
+    entrypoint: ["/bin/sh", "/mosquitto/gen-passwd.sh"]   # génère les comptes puis lance mosquitto
+    command: ["mosquitto", "-c", "/mosquitto/config/mosquitto.conf"]
+    environment:
+      MQTT_ESP_PASSWORD: ${MQTT_ESP_PASSWORD}
+      MQTT_API_PASSWORD: ${MQTT_API_PASSWORD}
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - ./infra/mosquitto/gen-passwd.sh:/mosquitto/gen-passwd.sh:ro
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - ./infra/mosquitto/acl:/mosquitto/config/acl:ro
+      - ./infra/pki/out/ca.crt:/mosquitto/certs/ca.crt:ro
+      - ./infra/pki/out/server.crt:/mosquitto/certs/server.crt:ro
+      - ./infra/pki/out/server.key:/mosquitto/certs/server.key:ro
+      - mosquitto-data:/mosquitto/data
+    ports:
+      - "8883:8883"   # MQTTS pour l'ESP ; le 1883 reste interne au réseau Docker
+    mem_limit: 128m
+
+  api:
+    <<: *common
+    build: ./api
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD}
+      MQTT_URL: tcp://mosquitto:1883
+      MQTT_USERNAME: api
+      MQTT_PASSWORD: ${MQTT_API_PASSWORD}
+      SERVER_FORWARD_HEADERS_STRATEGY: framework   # Spring lit l'IP réelle transmise par nginx
+    cap_drop: [ALL]
+    # aucun "ports:" : joignable uniquement via nginx (api:8080)
+    mem_limit: 512m
+
+  nginx:
+    <<: *common
+    image: nginx:alpine
+    environment:
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"
+      DASHBOARD_USER: ${DASHBOARD_USER:-admin}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/gen-htpasswd.sh:/docker-entrypoint.d/40-gen-htpasswd.sh:ro
+      - ./infra/pki/out/server.crt:/etc/nginx/certs/server.crt:ro
+      - ./infra/pki/out/server.key:/etc/nginx/certs/server.key:ro
+    read_only: true
+    tmpfs:
+      - /var/cache/nginx
+      - /var/run
+      - /tmp
+    cap_drop: [ALL]
+    cap_add: [CHOWN, SETUID, SETGID, NET_BIND_SERVICE]
+    ports:
+      - "443:443"     # HTTPS : dashboard + API, seule entrée web
+    mem_limit: 64m

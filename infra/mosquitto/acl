@@ -1,0 +1,9 @@
+# Remplacer g3 par votre numéro de groupe
+user esp
+topic write sentinel/g3/telemetry
+topic write sentinel/g3/status
+topic read  sentinel/g3/cmd
+
+user api
+topic read  sentinel/g3/#
+topic write sentinel/g3/cmd
